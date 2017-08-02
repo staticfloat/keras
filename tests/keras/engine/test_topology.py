@@ -750,6 +750,47 @@ def test_rebase_topology_nightmare():
     _d0 = 2.0*_a4
     assert model.predict(x_in) == _d0
 
+def test_switch_fork():
+    from keras.models import Model
+    from keras.layers import Input, Add, Dense, Activation
+    from keras.engine.topology import switch_fork
+    from numpy import array
+
+    # Create simple topology that looks like this:
+    #
+    # [x0] -> [d00] -> [d01] -\
+    #                          [a0] -> [a1]
+    # [x1] -> [d10] -> [d11] -/       /
+    #     \--------------------------/
+
+    x0 = Input(shape=(1,), name='x0')
+    x1 = Input(shape=(1,), name='x1')
+    d00 = Dense(1, name='d00', use_bias=False, weights=(array([[2.0]]),))(x0)
+    d01 = Dense(1, name='d01', use_bias=False, weights=(array([[1.5]]),))(d00)
+    d10 = Dense(1, name='d10', use_bias=False, weights=(array([[0.5]]),))(x1)
+    d11 = Dense(1, name='d11', use_bias=False, weights=(array([[0.25]]),))(d10)
+    a0 = Add()([d01, d11])
+    a1 = Add()([a0, x1])
+
+    # Ensure that this model calculates properly
+    model = Model(inputs=[x0, x1], outputs=[a1])
+    x_in = [array([1.0]), array([2.0])]
+    x_neg_in = [array([-1.0]), array([2.0])]
+    assert model.predict(x_in) == 1.0*2.0*1.5 + 2.0*0.5*0.25 + 2.0
+    assert model.predict(x_neg_in) == -1.0*2.0*1.5 + 2.0*0.5*0.25 + 2.0
+
+    # Now, create a fork by introducing a relu between d00 and d01
+    act0 = Activation('relu')(d00)
+    model = switch_fork(model, d00, act0)
+
+    # Ensure that this new switched model actually has an activation function
+    assert model.predict(x_in) == 1.0*2.0*1.5 + 2.0*0.5*0.25 + 2.0
+    assert model.predict(x_neg_in) == 0.0*2.0*1.5 + 2.0*0.5*0.25 + 2.0
+
+
+
+    
+
 
 if __name__ == '__main__':
     pytest.main([__file__])

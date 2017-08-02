@@ -2788,6 +2788,14 @@ def _collect_input_shape(input_tensors):
         return shapes[0]
     return shapes
 
+def _get_keras_layer(x):
+    """
+    Helper function to normalize layers/tensors to keras layers.
+    """
+    if hasattr(x, '_keras_history'):
+        return x._keras_history[0]
+    return x
+
 def rebase(model, onto, rebase_from=None, new_name=None):
     """Rebase one model onto another.
 
@@ -2810,14 +2818,6 @@ def rebase(model, onto, rebase_from=None, new_name=None):
         if the shapes of the layers are equivalent.
     """
     from collections import deque
-
-    def _get_keras_layer(x):
-        """
-        Helper function to normalize layers/tensors to keras layers.
-        """
-        if hasattr(x, '_keras_history'):
-            return x._keras_history[0]
-        return x
 
     def _collect_all_deps(x, deps={}):
         """
@@ -2978,6 +2978,80 @@ def rebase(model, onto, rebase_from=None, new_name=None):
                 new_outputs += [y]
 
     return model.__class__(inputs=onto.inputs, outputs=new_outputs, name=new_name)
+
+def switch_fork(model, old_prong, new_prong):
+    """
+    Given a fork within a graph, return a new `Model` with the fork switched.
+
+    Example: `model` contains the following topology:
+
+        [A (Input)] -> [B] -> [C] -> [D] -> [E] -> [F (Output)]
+
+    You then create a "fork", by creating two new layers off of `B`:
+
+                          /-> [C] -> [D] -> [E] -> [F (Output)]
+        [A (Input)] -> [B]
+                          \-> [G] -> [H]
+
+    By calling `switch_fork(model, D, H)`, the model will transform to:
+
+                          /-> [C] -> [D]
+        [A (Input)] -> [B]
+                          \-> [G] -> [H] -> [E] -> [F (Output)]
+
+    And the old prong can be safely ignored, resulting in a topology of:
+
+        [A (Input)] -> [B] -> [G] -> [H] -> [E] -> [F (Output)]
+    """
+    from keras.models import Model
+
+    def _collect_downstream_inputs(x, inputs, outputs = []):
+        """
+        Identify inputs to layers downstream of `x` that are not already within
+        the collection `inputs`, and add them in.  Despite that we are
+        collecting _inputs_ to downstream layers, these represent the _outputs_
+        of our `new_base` `Model`, hence the confusing function name.
+        """
+        x = _get_keras_layer(x)
+        
+        # For every layer going out of `x`:
+        for n in x.outbound_nodes:
+            l = n.outbound_layer
+
+            # Add this layer into `outputs`
+            if not l in outputs:
+                outputs.append(l)
+            
+            # For every _input_ to this output layer:
+            for n_in in l.inbound_nodes:
+                for idx in range(len(n_in.inbound_layers)):
+                    # If this input has not already been collected into inputs,
+                    # and it's not an output of a previous layer
+                    t_in = n_in.input_tensors[idx]
+                    l_in = n_in.inbound_layers[idx]
+                    if not t_in in inputs and not l_in in outputs:
+                        inputs.append(n_in.input_tensors[idx])
+            
+            # Recurse down into this output layer
+            _collect_downstream_inputs(l, inputs, outputs)
+        
+        # Return the collected inputs
+        return inputs
+
+
+    # The first thing we must do is to identify the outputs of `new_base`. One
+    # output will be `new_prong`, but the inputs to any other layer downstream
+    # of `old_prong` will be an output as well.  This denotes the "line" of
+    # layers that we will begin the rebasing from, working our way downstream.
+    rebase_from = _collect_downstream_inputs(old_prong, [old_prong])
+
+    # Remove `old_prong` from `rebase_from`, add in `new_prong` and call it the
+    # `new_base_outputs`.
+    base_outputs = [x if x != old_prong else new_prong for x in rebase_from]
+
+    # Construct new_base, then rebase `model` on top of this new fork!
+    new_base = Model(inputs=model.inputs, outputs=base_outputs)
+    return rebase(model, new_base, rebase_from=rebase_from)
 
 
 def save_weights_to_hdf5_group(f, layers):

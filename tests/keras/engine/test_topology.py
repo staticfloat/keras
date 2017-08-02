@@ -603,5 +603,153 @@ def test_shared_layer_depth_is_correct():
     assert input1_depth == input2_depth
 
 
+def test_rebase_switcheroo():
+    from keras.models import Model
+    from keras.layers import Input, Activation, Dense
+    from keras.engine.topology import rebase
+
+    # Create "old" model with 10-long input nodes
+    x_old = Input(shape=(10,))
+    y_old = Activation('tanh')(x_old)
+    model_old = Model(inputs=[x_old], outputs=[y_old])
+
+    # Rebase the Activation layer on top of new 20-long input nodes
+    x_new = Input(shape=(20,))
+    new_base = Model(inputs=[x_new], outputs=[x_new])
+    model_new = rebase(model_old, new_base)
+
+    # Assert that the model's shape is correct
+    assert model_old.output_shape == (None, 10)
+    assert model_new.output_shape == (None, 20)
+
+def test_rebase_weight_copying():
+    from keras.models import Model
+    from keras.layers import Input, Activation, Dense
+    from keras.engine.topology import rebase
+    from numpy import array
+
+    # Create "old" model with a single neuron
+    x = Input(shape=(1,))
+
+    # With a single Dense layer, y = w*x + b
+    w = array([[2.0]])
+    b = array([0.5])
+    y = Dense(1, use_bias=True, weights=(w, b))(x)
+
+    # Create a model and test that it does, in fact, calculate properly:
+    model = Model(inputs=[x], outputs=[y])
+    assert model.predict(array([1.5])) == 2.0*1.5 + 0.5
+    assert model.predict(array([-1.5])) == 2.0*-1.5 + 0.5
+
+    # Rebase it on top of a relu and ensure it still works for positive input
+    # but is different for negative input, implicitly ensuring that the weights
+    # have not changed since we set them.
+    new_act = Activation('relu')(x)
+    new_base = Model(inputs=[x], outputs=[new_act])
+    model = rebase(model, new_base)
+    assert model.predict(array([1.5])) == 2.0*1.5 + 0.5
+    assert model.predict(array([-1.5])) == 2.0*0.0 + 0.5
+
+def test_rebase_merge():
+    from keras.models import Model
+    from keras.layers import Input, Activation, Add, Dense
+    from keras.engine.topology import rebase
+    from numpy import array
+
+    # Create a model that adds two relu'd numbers together
+    x0 = Input(shape=(1,))
+    x1 = Input(shape=(1,))
+    r0 = Activation('relu')(x0)
+    r1 = Activation('relu')(x1)
+    a = Add()([r0, r1])
+    model = Model(inputs=[x0, x1], outputs=[a])
+    assert model.predict([array([1.0]), array([2.0])]) == 1.0 + 2.0
+    assert model.predict([array([-1.0]), array([-2.0])]) == 0.0 + 0.0
+
+    # Now sneak in a new 1x1 Dense layer _after_ the relus:
+    d0 = Dense(1, use_bias=False, weights=(array([[2.0]]),))(r0)
+    d1 = Dense(1, use_bias=False, weights=(array([[4.0]]),))(r1)
+    new_base = Model(inputs=[x0, x1], outputs=[d0, d1])
+    model = rebase(model, new_base, rebase_from=[r0, r1])
+
+    assert model.predict([array([1.0]), array([2.0])]) == 1.0*2.0 + 2.0*4.0
+    assert model.predict([array([-1.0]), array([2.0])]) == 0.0 + 2.0*4.0
+    assert model.predict([array([1.0]), array([-2.0])]) == 1.0*2.0 + 0.0
+    assert model.predict([array([-1.0]), array([-2.0])]) == 0.0 + 0.0
+
+def test_rebase_topology_nightmare():
+    from keras.models import Model
+    from keras.layers import Input, Add, Dense, Activation
+    from keras.engine.topology import rebase
+    from numpy import array
+
+    # Create a model with quite a mess, topologically speaking, and rebase it
+    x0 = Input(name='x0', shape=(1,))
+    x1 = Input(name='x1', shape=(1,))
+    x2 = Input(name='x2', shape=(1,))
+
+    a0 = Add(name='a0')([x0, x1])
+    a1 = Add(name='a1')([x0, a0])
+    a2 = Add(name='a2')([x0, x2])
+    a3 = Add(name='a3')([a0, a2])
+    a4 = Add(name='a4')([a1, a3])
+
+    d0 = Dense(1, name='d0', use_bias=False, weights=(array([[2.0]]),))(a4)
+    model = Model(inputs=[x0, x1, x2], outputs=[d0])
+
+    # This topology looks like:
+    #
+    #           ---------
+    #          /         \
+    # [x0]--------[a1]-- | -----------
+    #       \    /       |            \
+    #        [a0]------- | ------      [a4]---[d0]
+    #       /            |       \    /
+    # [x1]--             \        [a3]
+    #                     [a2]--/
+    # [x2]---------------/
+
+    # Ensure that the calculation goes as planned
+    x_in = [array([x]) for x in [1.0, 2.0, 3.0]]
+    _a0 = (1+2)
+    _a1 = (1+_a0)
+    _a2 = (1+3)
+    _a3 = (_a0 + _a2)
+    _a4 = (_a1 + _a3)
+    _d0 = 2.0*_a4
+    assert model.predict(x_in) == _d0
+    
+
+    # We are going to insert one new layer after a0:
+    #
+    #      --------------------
+    #     /                    \
+    # [x0]---------------[a1]-- | -----------
+    #       \           /       |            \
+    #        [a0]-[act0]------- | ------      [a4]---[d0]
+    #       /                   |       \    /
+    # [x1]--                    \        [a3]
+    #                             [a2]--/
+    # [x2]-----------------------/
+    #
+    #
+    # The "new base" model therefore has ouputs [x0, act0, x2], and
+    # `rebase_from` will be [x0, a0, x2]
+    act0 = Activation('relu', name='act0')(a0)
+    new_base = Model(inputs=[x0, x1, x2], outputs=[x0, act0, x2])
+    model = rebase(model, new_base, rebase_from=[x0, a0, x2])
+    assert model.predict(x_in) == _d0
+
+    # Test that with a negative x1, our relu is doing its job
+    x_in = [array([x]) for x in [1.0, -2.0, 3.0]]
+    _a0 = 0
+    _a1 = (1+_a0)
+    _a2 = (1+3)
+    _a3 = (_a0 + _a2)
+    _a4 = (_a1 + _a3)
+    _d0 = 2.0*_a4
+    assert model.predict(x_in) == _d0
+
+
 if __name__ == '__main__':
     pytest.main([__file__])

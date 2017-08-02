@@ -2788,6 +2788,197 @@ def _collect_input_shape(input_tensors):
         return shapes[0]
     return shapes
 
+def rebase(model, onto, rebase_from=None, new_name=None):
+    """Rebase one model onto another.
+
+    # Arguments
+        model: The `Model` to rebase onto the argument `onto`
+
+        onto: A `Model` containing the architecture that `model` should be
+            rebased onto.  In particular, the layers within `onto.outputs`
+            should directly correspond to those within `rebase_from`; this will
+            define the connections between the base model and the model being
+            rebased on top of it.
+        
+        rebase_from: A list of layers the rebasing starts from, defaults to
+            `model.inputs`, but can be used to discard a beginning segment
+            of `model`.  These layers will not be a part of the rebased model.
+
+    # Returns
+        A new `Model` containing the desired architecture.  Note that the
+        weights from `model` are transferred to the new model's layers only
+        if the shapes of the layers are equivalent.
+    """
+    from collections import deque
+
+    def _get_keras_layer(x):
+        """
+        Helper function to normalize layers/tensors to keras layers.
+        """
+        if hasattr(x, '_keras_history'):
+            return x._keras_history[0]
+        return x
+
+    def _collect_all_deps(x, deps={}):
+        """
+        Given a keras layer/tensor, collect all dependencies and add them into
+        a mapping from keras layer -> tensor, the same as maintained within the
+        `xfer` mapping.
+        """
+        x = _get_keras_layer(x)
+
+        for n in x.inbound_nodes:
+            for idx in range(len(n.inbound_layers)):
+                l = n.inbound_layers[idx]
+                deps[l] = n.input_tensors[idx]
+
+                # Recurse until we get all of the deps
+                deps = _collect_all_deps(l, deps)
+        
+        return deps
+
+
+    def _should_prune_layer(x, outputs):
+        """
+        Returns `True` if `x` does not eventually lead to one of the `outputs`.
+
+        Used to determine whether a layer should be pruned from consideration
+        when initializing `to_build`.
+        """
+        x = _get_keras_layer(x)
+
+        # If this layer is one of the given "good outputs", do not prune!
+        if x in outputs:
+            return False
+
+        # If this layer is a terminal point and is not in outputs, prune!
+        if len(x.outbound_nodes) == 0:
+            return True
+
+        # Otherwise, fully explore the downstream graph until we've exhausted
+        # every possibility that we should not prune.
+        return all(_should_prune_layer(n.outbound_layer, outputs) for n in x.outbound_nodes)
+
+    
+    # rebase_from denotes the beginning edge of the `model` we will rebase onto
+    # the `onto` model.
+    if rebase_from is None:
+        rebase_from = model.inputs
+    rebase_from = [_get_keras_layer(l) for l in _to_list(rebase_from)]
+
+    if len(onto.outputs) != len(rebase_from):
+        raise ValueError('Cannot rebase a Model with %d'%(len(rebase_from)) +
+            ' inputs onto a Model with %d outputs'%(len(onto.outputs)))
+
+    # Build a mapping from layers within `model`, to tensors in `onto`.  This
+    # mapping will grow as we build the model out, but we must seed it with
+    # these first few layers before bootstrapping onto the main rebase loop.
+    input_idxs = range(len(rebase_from))
+    xfer = {rebase_from[idx]:onto.outputs[idx] for idx in input_idxs}
+
+    # We also add everything upstream of `rebase_from` so that if some of the
+    # layers we must build depend on layers upstream of what has already been
+    # built, we don't redo extra work
+    for l in rebase_from:
+        xfer = _collect_all_deps(l, xfer)
+
+    # For all outputs from `rebase_from`, insert them into `to_build`, which
+    # will be our list of layers that we have yet to build, bundled together
+    # with their dependencies.  We only do this for nodes which eventually lead
+    # to `model.outputs` though.
+    to_build = deque()
+    layer_outputs = [_get_keras_layer(l) for l in model.outputs]
+    for idx in range(len(rebase_from)):
+        l = rebase_from[idx]
+        
+        # Get all the outputs from this layer
+        for n in l.outbound_nodes:
+            out_layer = n.outbound_layer
+
+            # If this layer doesn't actually reach `model.outputs`, skip it
+            if _should_prune_layer(out_layer, layer_outputs):
+                continue
+
+            # If this layer is actually already in xfer, skip it
+            if out_layer in xfer:
+                continue
+
+            # If this layer is already in to_build, skip it
+            if any(x[0] == out_layer for x in to_build):
+                continue
+
+            # Get all the dependencies (inputs) for this output            
+            deps = []
+            for n_in in out_layer.inbound_nodes:
+                deps += [_get_keras_layer(l) for l in n_in.inbound_layers]
+
+            # Add this output as one of the next layers to build
+            to_build.append((out_layer, deps))
+    
+    # Now walk forward through the old model until we've rebuilt everything on
+    # top of `onto`, which we do by running until `to_build` is empty.  We also
+    # track new outputs, which we will register with the model at the end.
+    new_outputs = []
+    while len(to_build) != 0:
+        # Grab the next layer to build
+        next_to_build, next_deps = to_build.popleft()
+
+        # Translate all the dependencies, if possible
+        dep_idxs = range(len(next_deps))
+        for idx in dep_idxs:
+            if next_deps[idx] in xfer:
+                next_deps[idx] = xfer[next_deps[idx]]
+
+        # If any of the deps are not already built, then don't build it
+        if any(next_deps[idx] not in xfer.values() for idx in dep_idxs):
+            to_build.append((next_to_build, next_deps))
+        else:
+            # Otherwise, build it!  Start by instantiating a new layer:
+            config = next_to_build.get_config()
+            next_layer = next_to_build.__class__.from_config(config)
+
+            # Hook that layer up to its inputs.  This seems a little ad-hoc,
+            # there must be a more reliable way to hook up layers.
+            if len(next_deps) == 1:
+                y = next_layer(next_deps[0])
+            else:
+                y = next_layer(next_deps)
+
+            # If weight shape has not changed, copy the weights over:
+            w_old = next_to_build.get_weights()
+            w_new = next_layer.get_weights()
+            if len(w_old) == len(w_new):
+                widxs = range(len(w_old))
+                if all([w_old[idx].shape == w_new[idx].shape for idx in widxs]):
+                    next_layer.set_weights(w_old)
+
+            # Register it in `xfer`, so that it can be used as a dependency in the future.
+            xfer[next_to_build] = y
+
+            # Queue this layer's outputs (along with its dependencies)
+            for n in next_to_build.outbound_nodes:
+                out = n.outbound_layer
+
+                # Don't add this layer onto `to_build` if it's already there
+                if any(x[0] == out for x in to_build):
+                    continue
+
+                # Don't add this layer onto `to_build` if it's already in `xfer`:
+                if out in xfer:
+                    continue
+
+                out_deps = []
+                for n_in in out.inbound_nodes:
+                    out_deps += n_in.inbound_layers
+
+                to_build.append((out, [_get_keras_layer(l) for l in out_deps]))
+
+            # If there were actually no outbound_nodes, then this is a new output!
+            if not next_to_build.outbound_nodes:
+                new_outputs += [y]
+
+    return model.__class__(inputs=onto.inputs, outputs=new_outputs, name=new_name)
+
 
 def save_weights_to_hdf5_group(f, layers):
     from .. import __version__ as keras_version
